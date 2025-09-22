@@ -1,49 +1,142 @@
-name: RDP
+name: RDP via cloudflared (Hosted)
+
 on:
   workflow_dispatch:
+
 jobs:
-  secure-rdp:
-    runs-on: windows-2022   # Windows Server 2022 (قريب من Windows 11)
-    timeout-minutes: 3600
+  rdp-cloudflared:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
     steps:
-      - name: Configure Core RDP Settings
+      - name: Check secrets
+        shell: pwsh
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
+          Write-Host "RDP_PASSWORD secret present: $([bool]('${{ secrets.RDP_PASSWORD }}'))"
+          Write-Host "CF_TUNNEL_TOKEN present: $([bool]('${{ secrets.CF_TUNNEL_TOKEN }}'))"
+
+      - name: Enable RDP & Firewall
+        shell: pwsh
+        run: |
+          Write-Host "Enabling Remote Desktop and firewall rules..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
+          netsh advfirewall firewall add rule name="Allow RDP (cloudflared)" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Static Password
+      - name: Create local RDP user (from secret)
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $password = "admin@123"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
+          if (-not $env:RDP_PASSWORD) { Write-Error "Missing RDP_PASSWORD secret"; exit 1 }
+          $username = "TOOLBOXLAP"
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+            Write-Host "User $username created."
+          } else {
+            Write-Host "User $username exists — updating password."
+            $u = Get-LocalUser -Name $username
+            $u | Set-LocalUser -Password $securePass
           }
-          Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP"
-          echo "RDP_CREDS=User: TOOLBOXLAP | Password: $password" >> $env:GITHUB_ENV
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Write-Host "User in groups: Remote Desktop Users, Administrators"
 
-      - name: Install Cloudflared
+      - name: Download cloudflared
+        shell: pwsh
         run: |
-          Invoke-WebRequest -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe -OutFile C:\cloudflared.exe
+          $out = "C:\cloudflared"
+          if (-Not (Test-Path $out)) { New-Item -ItemType Directory -Path $out | Out-Null }
+          $exePath = Join-Path $out "cloudflared.exe"
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $exePath
+          Write-Host "cloudflared downloaded to $exePath"
 
-      - name: Start Cloudflared Tunnel
+      - name: Start Cloudflared Tunnel (token mode or quick mode)
+        shell: pwsh
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          Start-Process -NoNewWindow -FilePath "C:\cloudflared.exe" -ArgumentList "tcp --url localhost:3389" -PassThru
-          Start-Sleep -Seconds 10
-          Invoke-WebRequest -Uri http://127.0.0.1:4040/api/tunnels | Out-File tunnel.json
-          Get-Content tunnel.json
+          $exe = "C:\cloudflared\cloudflared.exe"
+          if (-not (Test-Path $exe)) { Write-Error "cloudflared not found at $exe"; exit 1 }
 
-      - name: Keep RDP Alive
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Username: TOOLBOXLAP"
-          Write-Host "Password: admin@123"
-          Write-Host "Use the Cloudflare Tunnel details above to connect"
-          Write-Host "==================`n"
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active..."
-              Start-Sleep -Seconds 300
+          # If token provided -> install service (recommended, requires token from Dashboard)
+          if ($env:CF_TUNNEL_TOKEN -and $env:CF_TUNNEL_TOKEN.Trim() -ne "") {
+            Write-Host "Using CF_TUNNEL_TOKEN mode: installing cloudflared service..."
+            # service install supports either a token or credentials file path; here we pass token directly
+            & $exe service install $env:CF_TUNNEL_TOKEN
+            Start-Sleep -Seconds 3
+            Start-Service -Name cloudflared -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+            Write-Host "Service started. Check Cloudflare Dashboard for public hostname mapping."
+            # No guaranteed ephemeral URL printed — user should configure public hostname in Dashboard
           }
+          else {
+            Write-Host "No CF_TUNNEL_TOKEN provided -> running quick tunnel (ephemeral) and capturing URL..."
+            $log = "C:\cloudflared\cloudflared.log"
+            if (Test-Path $log) { Remove-Item $log -Force }
+            # Start cloudflared as background job, redirect stdout/stderr to log
+            Start-Job -ScriptBlock {
+              & "C:\cloudflared\cloudflared.exe" tunnel --url "tcp://localhost:3389" *>&1 | Out-File -FilePath "C:\cloudflared\cloudflared.log" -Encoding UTF8
+            } | Out-Null
+
+            # wait & poll log for trycloudflare or public URL
+            $public = $null
+            for ($i=0; $i -lt 40 -and -not $public; $i++) {
+              Start-Sleep -Seconds 2
+              if (Test-Path $log) {
+                $txt = Get-Content $log -Raw -ErrorAction SilentlyContinue
+                if ($txt -match "trycloudflare.com" -or $txt -match "https?://[^\s]+" ) {
+                  # find line containing trycloudflare or tcp forwarding
+                  $lines = $txt -split "`r?`n"
+                  foreach ($ln in $lines) {
+                    if ($ln -match "(\S+\.trycloudflare\.com:\d+)" -or $ln -match "Forwarding[^\:]*tcp://([^ ]+)") {
+                      $m = $Matches[1]
+                      if (-not $m) {
+                        if ($ln -match "Forwarding[^\:]*tcp://([^ ]+)") { $m = $Matches[1] }
+                      }
+                      $public = $m
+                      break
+                    }
+                  }
+                }
+              }
+            }
+
+            if (-not $public) {
+              Write-Host "===== cloudflared log (tail 200) ====="
+              if (Test-Path $log) { Get-Content $log -Tail 200 } else { Write-Host "(no cloudflared log found)" }
+              Write-Error "Failed to get public URL from cloudflared. See log above. If you need a permanent hostname, create a tunnel in Cloudflare Dashboard and provide CF_TUNNEL_TOKEN secret."
+              exit 1
+            }
+
+            Write-Host "`n=== CLOUDFLARE TUNNEL ==="
+            Write-Host "Public address: $public"
+            Write-Host "Connect with RDP to: $public  (user: TOOLBOXLAP, pass: from secret RDP_PASSWORD)"
+            Write-Host "=====================================`n"
+            echo "CLOUD_PUBLIC=$public" >> $env:GITHUB_ENV
+          }
+
+      - name: Show connection info & keep alive
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host ""
+          Write-Host "=== CONNECTION INFO ==="
+          Write-Host "User: TOOLBOXLAP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          if ($env:CLOUD_PUBLIC) {
+            Write-Host "Public endpoint: $env:CLOUD_PUBLIC"
+            Write-Host "To connect from client:"
+            Write-Host "  1) If Cloudflare access used, run: cloudflared access tcp --hostname <your-public-hostname> --url rdp://localhost:3389"
+            Write-Host "  2) Then open Remote Desktop and connect to localhost:3389"
+          } else {
+            Write-Host "If you installed tunnel via Dashboard, open the Dashboard to see Public Hostname mapping."
+            Write-Host "If ephemeral mode used, public URL printed above in previous step."
+          }
+          Write-Host "======================"
+          # keep workflow alive so tunnel stays up
+          while ($true) { Start-Sleep -Seconds 300 }
